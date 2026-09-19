@@ -2,15 +2,12 @@
 #define FOC_CONTROL_H
 #include "main.h"
 #include "adc.h"
-#include "spi.h"
 #include "tim.h"
 #include <stdint.h>
 #define FOC_PI 3.14159265358979323846f
 #define FOC_2PI 6.2831853071795864769f
 #define FOC_ENCODER_NOT_READY    (1UL << 0)
-#define FOC_ENCODER_PARITY_ERROR (1UL << 1)
-#define FOC_ENCODER_NO_MAG       (1UL << 2)
-#define FOC_ENCODER_SPI_ERROR    (1UL << 3)
+#define FOC_ENCODER_SIGNAL_ERROR (1UL << 1)
 #define FOC_MOTOR_POLE_PAIRS     8.0f
 #define FOC_STATE_IDLE          0U
 #define FOC_STATE_CALIBRATING   1U
@@ -53,10 +50,9 @@ float FOC_GetIq(void);
 float FOC_GetId(void);
 float FOC_GetBusVoltage(void);
 FOC_ControlMode FOC_GetControlMode(void);
-/* Last valid single-turn mechanical angle: 0..16383. */
+/* Single-turn mechanical angle scaled to the legacy 0..16383 range. */
 uint16_t FOC_GetEncoderRawAngle(void);
-/* Zero means the latest completed angle pair is valid. Transient errors are
-   retried; control stops only when no valid angle arrives for 20 ms. */
+/* Zero means TIM3 A/B counting is active and no implausible edge burst exists. */
 uint32_t FOC_GetEncoderStatus(void);
 uint32_t FOC_GetState(void);
 uint32_t FOC_GetFault(void);

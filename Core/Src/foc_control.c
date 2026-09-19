@@ -30,11 +30,17 @@
 #define SPEED_REFERENCE_SLEW_RPM_PER_S 3000.0f
 #define SPEED_LOOP_CURRENT_LIMIT 2.0f
 #define ALIGN_VOLTAGE 0.04f
-#define FOC_CALIBRATION_ADDRESS 0x0801F000UL
-#define FOC_CALIBRATION_MAGIC 0x464F4342UL
-#define FOC_CALIBRATION_CHECK 0xA53C91E7UL
-/* Set to 1 for one firmware run to replace the stored encoder calibration. */
-#define FOC_FORCE_ENCODER_CALIBRATION 0U
+/* MT6816 AB pulse count per mechanical revolution. TIM3 encoder mode counts
+   four edges per pulse. Change this to 1000 for MT6816xx-AKD, etc. */
+#ifndef MT6816_AB_PULSES_PER_REV
+#define MT6816_AB_PULSES_PER_REV 1024U
+#endif
+#define ENCODER_COUNTS_PER_REV (4U * MT6816_AB_PULSES_PER_REV)
+#define ENCODER_SPEED_SAMPLES 20U
+/* More than 256 counts in 50 us would exceed 75 krpm at 4096 count/rev and
+   is treated as an electrical glitch rather than real shaft motion. */
+#define ENCODER_MAX_DELTA_PER_SAMPLE 256
+#define ENCODER_MAX_CONSECUTIVE_GLITCHES 8U
 
 typedef struct { float kp, ki, integ, out; } pi_t;
 static volatile float angle, angle_multi, speed, iq, id, iq_ref_amp, iq_ref_target;
@@ -43,15 +49,16 @@ static volatile float dc_bus_voltage = DC_BUS_NOMINAL_V;
 static volatile float current_pi_bus_scale = 1.0f;
 static volatile uint32_t dc_bus_voltage_valid;
 static volatile FOC_ControlMode control_mode = FOC_MODE_TORQUE;
-/* MT6816: two separate 16-clock frames, each sent as two 8-bit bytes. */
-static uint8_t enc_rx[2];
-static uint8_t enc_tx[2] = {0x83U, 0x00U};
-static uint8_t enc_high, enc_read_low, enc_initialized;
-static volatile uint8_t enc_sampling_enabled, enc_busy;
+static volatile uint8_t enc_initialized;
 static volatile uint16_t enc_raw;
 static volatile uint32_t enc_status = FOC_ENCODER_NOT_READY;
-static volatile uint32_t enc_last_valid_ms;
-volatile uint32_t encoder_bad_frame_count, encoder_spi_error_count;
+static uint16_t enc_last_counter;
+static volatile int32_t enc_position_counts;
+static volatile int32_t enc_speed_counts;
+static int32_t enc_speed_accumulator;
+static uint32_t enc_speed_sample_count;
+static uint32_t enc_consecutive_glitches;
+volatile uint32_t encoder_bad_edge_count;
 volatile uint32_t encoder_fault_status_snapshot, encoder_fault_age_ms;
 static volatile uint32_t foc_state = FOC_STATE_IDLE, foc_fault;
 static volatile uint32_t overcurrent_detail;
@@ -66,7 +73,6 @@ static volatile uint32_t offset_samples;
 static float offset_u, offset_v;
 static volatile float align_theta;
 static float encoder_direction = 1.0f, electrical_offset;
-static float enc_prev, enc_turns;
 /* 330285: Rll=0.464 ohm, Lll=0.322 mH. Conservative current-loop
    tuning for a 20 kHz update rate and approximately 16 V DC bus. */
 static pi_t pi_q = {0.1f, 0.003f, 0, 0};
@@ -246,153 +252,68 @@ static void stop_fault(uint32_t fault)
     speed_ref_rad_s = 0.0f;
     pi_speed.integ = 0.0f;
     pi_speed.out = 0.0f;
-    enc_sampling_enabled = 0U;
     HAL_GPIO_WritePin(DRV_cotr_GPIO_Port, DRV_cotr_Pin, GPIO_PIN_RESET);
 }
 
 static uint32_t encoder_healthy(void)
 {
-    /* A valid recent angle is sufficient. Parity/DMA errors are recoverable;
-       only stop after interference has prevented every valid frame for 20 ms. */
-    return enc_initialized && (HAL_GetTick() - enc_last_valid_ms < 20U);
+    return enc_initialized && enc_consecutive_glitches < ENCODER_MAX_CONSECUTIVE_GLITCHES;
 }
 
-static void encoder_cs_delay(void)
+static void encoder_reset_position(void)
 {
-    /* At 170 MHz, 64 NOPs alone exceed 376 ns. Covers TL >= 100 ns,
-       TH >= 0.5 SCK (94 ns at /32), and provides a CS-high gap. */
-    for (uint32_t i = 0; i < 64U; ++i) { __NOP(); }
-}
-
-static void encoder_start_frame(uint8_t command)
-{
-    enc_tx[0] = command;
-    enc_busy = 1U;
-    encoder_cs_delay();
-    HAL_GPIO_WritePin(MT6816_CS_GPIO_Port, MT6816_CS_Pin, GPIO_PIN_RESET);
-    encoder_cs_delay();
-    if (HAL_SPI_TransmitReceive_DMA(&hspi1, enc_tx, enc_rx, 2U) != HAL_OK)
-    {
-        enc_busy = 0U;
-        enc_read_low = 0U;
-        HAL_GPIO_WritePin(MT6816_CS_GPIO_Port, MT6816_CS_Pin, GPIO_PIN_SET);
-        enc_status |= FOC_ENCODER_SPI_ERROR;
-        ++encoder_spi_error_count;
-    }
-}
-
-static void encoder_update(uint8_t high, uint8_t low)
-{
-    uint16_t word = ((uint16_t)high << 8) | low;
-    uint16_t parity = word;
-    uint32_t status = enc_initialized ? 0U : FOC_ENCODER_NOT_READY;
-    /* Even parity covers all 16 bits, including No_Mag_Warning and PC. */
-    parity ^= parity >> 8;
-    parity ^= parity >> 4;
-    parity ^= parity >> 2;
-    parity ^= parity >> 1;
-    if (parity & 1U) { status |= FOC_ENCODER_PARITY_ERROR; }
-    if (low & 2U) { status |= FOC_ENCODER_NO_MAG; }
-    if (status & (FOC_ENCODER_PARITY_ERROR | FOC_ENCODER_NO_MAG))
-    {
-        enc_status = status;
-        ++encoder_bad_frame_count;
-        return; /* Keep the last valid angle; do not feed corrupt data to FOC. */
-    }
-
-    uint16_t raw = word >> 2;
-    float a = FOC_2PI * (float)raw / 16384.0f;
-    if (enc_initialized)
-    {
-        float d = (float)raw - enc_prev;
-        if (d > 8192.0f) { enc_turns -= FOC_2PI; }
-        else if (d < -8192.0f) { enc_turns += FOC_2PI; }
-    }
-    enc_prev = (float)raw;
-    enc_raw = raw;
-    angle = a;
-    angle_multi = enc_turns + a;
-    enc_initialized = 1U;
-    enc_last_valid_ms = HAL_GetTick();
+    __HAL_TIM_SET_COUNTER(&htim3, 0U);
+    enc_last_counter = 0U;
+    enc_position_counts = 0;
+    enc_speed_counts = 0;
+    enc_speed_accumulator = 0;
+    enc_speed_sample_count = 0U;
+    enc_consecutive_glitches = 0U;
+    enc_raw = 0U;
+    angle = 0.0f;
+    angle_multi = 0.0f;
     enc_status = 0U;
+    enc_initialized = 1U;
+}
+
+/* Called synchronously with the 20-kHz current loop, like the TIGERs encoder
+   capture path. Signed 16-bit subtraction handles TIM3 counter wrap. */
+static void encoder_sample(void)
+{
+    uint16_t counter = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+    int32_t delta = (int16_t)(counter - enc_last_counter);
+    enc_last_counter = counter;
+
+    if (delta > ENCODER_MAX_DELTA_PER_SAMPLE ||
+        delta < -ENCODER_MAX_DELTA_PER_SAMPLE)
+    {
+        ++encoder_bad_edge_count;
+        ++enc_consecutive_glitches;
+        enc_status = FOC_ENCODER_SIGNAL_ERROR;
+        return;
+    }
+    enc_consecutive_glitches = 0U;
+    enc_status = 0U;
+    enc_position_counts += delta;
+    enc_speed_accumulator += delta;
+    if (++enc_speed_sample_count >= ENCODER_SPEED_SAMPLES)
+    {
+        enc_speed_counts = enc_speed_accumulator;
+        enc_speed_accumulator = 0;
+        enc_speed_sample_count = 0U;
+    }
+
+    int32_t single_turn = enc_position_counts % (int32_t)ENCODER_COUNTS_PER_REV;
+    if (single_turn < 0) { single_turn += (int32_t)ENCODER_COUNTS_PER_REV; }
+    angle = FOC_2PI * (float)single_turn / (float)ENCODER_COUNTS_PER_REV;
+    angle_multi = FOC_2PI * (float)enc_position_counts /
+                  (float)ENCODER_COUNTS_PER_REV;
+    enc_raw = (uint16_t)(((uint32_t)single_turn * 16384U) /
+                         ENCODER_COUNTS_PER_REV);
 }
 
 static float clamp(float x,float lo,float hi){return x<lo?lo:(x>hi?hi:x);}
 static float wrap(float x){ while(x>FOC_PI)x-=FOC_2PI; while(x<-FOC_PI)x+=FOC_2PI; return x; }
-
-static uint32_t calibration_checksum(uint32_t direction, uint32_t offset)
-{
-    return FOC_CALIBRATION_MAGIC ^ direction ^ offset ^ FOC_CALIBRATION_CHECK;
-}
-
-static uint32_t calibration_load(void)
-{
-    const volatile uint32_t *words=(const volatile uint32_t *)FOC_CALIBRATION_ADDRESS;
-    union { uint32_t bits; float value; } offset;
-    uint32_t direction=words[1];
-    offset.bits=words[2];
-
-    if (words[0] != FOC_CALIBRATION_MAGIC ||
-        words[3] != calibration_checksum(direction,offset.bits) ||
-        (direction != 1U && direction != 0xffffffffU) ||
-        !isfinite(offset.value) || fabsf(offset.value) > FOC_PI)
-    {
-        return 0U;
-    }
-
-    encoder_direction=direction == 1U ? 1.0f : -1.0f;
-    electrical_offset=offset.value;
-    return 1U;
-}
-
-static uint32_t calibration_save(void)
-{
-    union { uint32_t bits; float value; } offset;
-    FLASH_EraseInitTypeDef erase={0};
-    uint32_t page_error=0xffffffffU;
-    uint32_t direction=encoder_direction > 0.0f ? 1U : 0xffffffffU;
-    uint32_t check;
-    uint64_t first,second;
-    HAL_StatusTypeDef status;
-
-    offset.value=electrical_offset;
-    check=calibration_checksum(direction,offset.bits);
-    first=(uint64_t)FOC_CALIBRATION_MAGIC | ((uint64_t)direction << 32);
-    second=(uint64_t)offset.bits | ((uint64_t)check << 32);
-
-    erase.TypeErase=FLASH_TYPEERASE_PAGES;
-    erase.NbPages=1U;
-#if defined(FLASH_OPTR_DBANK)
-    if ((FLASH->OPTR & FLASH_OPTR_DBANK) != 0U)
-    {
-        erase.Banks=FLASH_BANK_2;
-        erase.Page=(FOC_CALIBRATION_ADDRESS-FLASH_BASE-FLASH_BANK_SIZE)/FLASH_PAGE_SIZE;
-    }
-    else
-    {
-        erase.Banks=FLASH_BANK_1;
-        erase.Page=(FOC_CALIBRATION_ADDRESS-FLASH_BASE)/FLASH_PAGE_SIZE_128_BITS;
-    }
-#else
-    erase.Banks=FLASH_BANK_1;
-    erase.Page=(FOC_CALIBRATION_ADDRESS-FLASH_BASE)/FLASH_PAGE_SIZE;
-#endif
-
-    if (HAL_FLASH_Unlock() != HAL_OK) { return 0U; }
-    status=HAL_FLASHEx_Erase(&erase,&page_error);
-    if (status == HAL_OK)
-    {
-        status=HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
-                                 FOC_CALIBRATION_ADDRESS,first);
-    }
-    if (status == HAL_OK)
-    {
-        status=HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
-                                 FOC_CALIBRATION_ADDRESS+8U,second);
-    }
-    HAL_FLASH_Lock();
-    return status == HAL_OK && calibration_load();
-}
 
 static void pwm(float a,float b,float c){
  a=clamp(a,0,MAX_MOD); b=clamp(b,0,MAX_MOD); c=clamp(c,0,MAX_MOD);
@@ -625,18 +546,16 @@ void FOC_Init(void)
         HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_2) != HAL_OK ||
         HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_3) != HAL_OK ||
         HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_4) != HAL_OK ||
+        HAL_TIM_Encoder_Start(&htim3,TIM_CHANNEL_ALL) != HAL_OK ||
         HAL_TIM_Base_Start_IT(&htim5) != HAL_OK)
     {
         stop_fault(FOC_FAULT_STARTUP);
         return;
     }
-    HAL_GPIO_WritePin(MT6816_CS_GPIO_Port,MT6816_CS_Pin,GPIO_PIN_SET);
-    enc_read_low = 0U;
-    enc_sampling_enabled = 1U;
-    encoder_start_frame(0x83U);
+    encoder_reset_position();
     /* Gather real CSA offsets with INL held low, not an assumed mid-scale. */
     uint32_t start = HAL_GetTick();
-    while (offset_samples < 128U || !encoder_healthy())
+    while (offset_samples < 128U)
     {
         if (HAL_GetTick() - start >= 500U)
         {
@@ -645,49 +564,38 @@ void FOC_Init(void)
         }
         HAL_Delay(1U);
     }
-    if (FOC_FORCE_ENCODER_CALIBRATION || !calibration_load())
+    /* A/B alone has no absolute power-up position. Align on every boot, then
+       use the measured count sign and final position to establish Park angle. */
+    align_theta = 0.0f;
+    current_sense_blank_samples = CURRENT_SENSE_BLANK_SAMPLES;
+    foc_state = FOC_STATE_ALIGNING;
+    if (!align_wait(800U)) { return; }
+    int32_t initial_counts = enc_position_counts;
+    for (uint32_t step = 1U; step <= 1500U; ++step)
     {
-        align_theta = 0.0f;
-        current_sense_blank_samples = CURRENT_SENSE_BLANK_SAMPLES;
-        foc_state = FOC_STATE_ALIGNING;
-        if (!align_wait(800U)) { return; }
-        float initial_angle = angle;
-        /* Determine direction once by sweeping an open-loop stator field over
-           half an electrical turn. The alignment path deliberately bypasses
-           the current PI and its as-yet-uncalibrated Park angle. */
-        for (uint32_t step = 1U; step <= 1500U; ++step)
-        {
-            align_theta = FOC_PI * (float)step / 1500.0f;
-            if (!align_wait(1U)) { return; }
-        }
-        if (!align_wait(500U)) { return; }
-        float delta = wrap(angle - initial_angle);
-        float expected = FOC_PI / FOC_MOTOR_POLE_PAIRS;
-        /* Reject a sweep too small to establish encoder direction reliably. */
-        if (fabsf(delta) < 0.25f*expected)
-        {
-            stop_fault(FOC_FAULT_ALIGNMENT);
-            Blink_LED(LED_5V);
-            HAL_Delay(700U);
-            if (Blink_GDF_Detail() == 0U)
-            {
-                HAL_Delay(700U);
-                Blink_Alignment_Detail(delta, expected);
-            }
-            return;
-        }
-        encoder_direction = delta > 0.0f ? 1.0f : -1.0f;
-        /* The rotor is held at the final commanded electrical angle before
-           this sample, so capture the offset at the same operating point. */
-        electrical_offset = wrap(encoder_direction * angle * FOC_MOTOR_POLE_PAIRS - FOC_PI);
-
-        /* Stop the bridge before erasing/programming the calibration page. */
-        HAL_GPIO_WritePin(DRV_cotr_GPIO_Port, DRV_cotr_Pin, GPIO_PIN_RESET);
-        foc_state = FOC_STATE_CALIBRATING;
-        (void)calibration_save();
+        align_theta = FOC_PI * (float)step / 1500.0f;
+        if (!align_wait(1U)) { return; }
     }
-    /* Drop INL while changing frames/resetting PI, so an ISR cannot re-enable
-       the bridge with partially published calibration data. */
+    if (!align_wait(500U)) { return; }
+    int32_t delta_counts = enc_position_counts - initial_counts;
+    float delta = FOC_2PI * (float)delta_counts /
+                  (float)ENCODER_COUNTS_PER_REV;
+    float expected = FOC_PI / FOC_MOTOR_POLE_PAIRS;
+    if (fabsf(delta) < 0.25f*expected)
+    {
+        stop_fault(FOC_FAULT_ALIGNMENT);
+        Blink_LED(LED_5V);
+        HAL_Delay(700U);
+        if (Blink_GDF_Detail() == 0U)
+        {
+            HAL_Delay(700U);
+            Blink_Alignment_Detail(delta, expected);
+        }
+        return;
+    }
+    encoder_direction = delta_counts > 0 ? 1.0f : -1.0f;
+    electrical_offset = wrap(encoder_direction * angle * FOC_MOTOR_POLE_PAIRS - FOC_PI);
+    /* Drop INL while publishing the aligned angle and resetting every PI. */
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     HAL_GPIO_WritePin(DRV_cotr_GPIO_Port, DRV_cotr_Pin, GPIO_PIN_RESET);
@@ -714,55 +622,15 @@ uint32_t FOC_GetEncoderStatus(void){return enc_status;}
 uint32_t FOC_GetState(void){return foc_state;}
 uint32_t FOC_GetFault(void){return foc_fault;}
 
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *h)
-{
-    if(h->Instance!=SPI1) return;
-    /* HAL has waited for SPI BSY to clear before this callback. */
-    encoder_cs_delay();
-    HAL_GPIO_WritePin(MT6816_CS_GPIO_Port,MT6816_CS_Pin,GPIO_PIN_SET);
-    if (!enc_sampling_enabled)
-    {
-        enc_busy = 0U;
-        return;
-    }
-    if (!enc_read_low)
-    {
-        enc_high = enc_rx[1]; /* First RX byte is not register data. */
-        enc_read_low = 1U;
-        encoder_start_frame(0x84U);
-    }
-    else
-    {
-        encoder_update(enc_high, enc_rx[1]);
-        enc_read_low = 0U;
-        enc_busy = 0U;
-    }
-}
-
-void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *h)
-{
-    if (h->Instance != SPI1) { return; }
-    encoder_cs_delay();
-    HAL_GPIO_WritePin(MT6816_CS_GPIO_Port, MT6816_CS_Pin, GPIO_PIN_SET);
-    enc_busy = 0U;
-    enc_read_low = 0U;
-    enc_status |= FOC_ENCODER_SPI_ERROR;
-    ++encoder_spi_error_count;
-    /* Retain the last valid angle and let the next scheduled frame restart
-       the two-frame transaction. A single EMI event must not latch a fault. */
-}
-
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *h)
 {
     if(h->Instance==TIM5)
         {
-            static float last;
-            static uint32_t have_last;
-            float current = angle;
-            if (!encoder_healthy()) { have_last=0U; speed=0.0f; return; }
-            if (have_last) { speed=0.15f*wrap(current-last)/0.001f+0.85f*speed; }
-            last=current;
-            have_last=1U;
+            if (!encoder_healthy()) { speed=0.0f; return; }
+            float instant_speed = (float)enc_speed_counts * FOC_2PI *
+                                  SPEED_LOOP_HZ /
+                                  (float)ENCODER_COUNTS_PER_REV;
+            speed=0.15f*instant_speed+0.85f*speed;
 
             if (foc_state == FOC_STATE_RUNNING && control_mode == FOC_MODE_SPEED)
             {
@@ -804,20 +672,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *h)
 
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
 {
-    static uint32_t encoder_divider;
     static uint32_t control_divider;
     static uint32_t overcurrent_count;
     if(h->Instance!=ADC1)  return;
-
-    /* CH4 triggers ADC once per 40 kHz PWM period. Keep MT6816 at 4 kHz. */
-    if (++encoder_divider >= 10U)
-    {
-        encoder_divider = 0U;
-        if (enc_sampling_enabled && !enc_busy && !enc_read_low)
-        {
-            encoder_start_frame(0x83U);
-        }
-    }
 
     // calibrate ADC
     if (foc_state == FOC_STATE_CALIBRATING)
@@ -842,12 +699,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
     if (++control_divider < 2U) { return; }
     control_divider = 0U;
 
+    encoder_sample();
+
     if (foc_state != FOC_STATE_ALIGNING && foc_state != FOC_STATE_RUNNING) return;
 
     if (!encoder_healthy()) 
     { 
         encoder_fault_status_snapshot = enc_status;
-        encoder_fault_age_ms = HAL_GetTick() - enc_last_valid_ms;
+        encoder_fault_age_ms = enc_consecutive_glitches;
         stop_fault(FOC_FAULT_ENCODER); 
         return; 
     }
