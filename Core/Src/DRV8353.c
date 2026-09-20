@@ -65,10 +65,18 @@ StruDRV835XCfgPara stru_config =
    .VREF_DIV = VREF_DIV_2,    //  1b = Sense amplifier reference voltage is VREF divided by 2
     
     // OCP Control Register (address = 0x05h)
-   .VDS_LVL =  VDS_LVL_0_9,
+   /* VDS protection observes switched MOSFET drain-source voltage, so its
+      threshold must include hot RDS(on), switching ringing and PCB parasitics.
+      80 mV produced false VDS_HC trips at the 9-A operating point. 200 mV is
+      still a much stronger hardware backstop than the former 0.9-V setting;
+      the calibrated ADC current path provides the lower 11/15-A limits. */
+   .VDS_LVL =  VDS_LVL_0_2,
    .OCP_DEG =  OCP_DEG_4US,
-   .OCP_MODE = OCP_LATCH,     // Shut the bridge down instead of only reporting OCP
+   /* Retry after a transient obstruction instead of requiring a reset. A
+      persistent VDS fault is still latched by the controller fault monitor. */
+   .OCP_MODE = OCP_RETRY,
    .DEAD_TIME = DEADTIME_400NS,
+   .TRETRY = TRETRY_8MS,
     
    //Gate Drive HS Register (address = 0x03h)
    /* BSC028N06NS has about 37 nC total gate charge. Start with controlled
@@ -138,6 +146,7 @@ HAL_StatusTypeDef DRV835X_updateCfgPara(void)
     stru_DRV8353Obj.drvOcp_obj.ocpObj.OCP_DEG =  stru_config.OCP_DEG;
     stru_DRV8353Obj.drvOcp_obj.ocpObj.OCP_MODE = stru_config.OCP_MODE;
     stru_DRV8353Obj.drvOcp_obj.ocpObj.DEAD_TIME = stru_config.DEAD_TIME;
+    stru_DRV8353Obj.drvOcp_obj.ocpObj.TRETRY = stru_config.TRETRY;
     data = stru_DRV8353Obj.drvOcp_obj.data;
     WRITE_STAGE(DRV835X_STAGE_WRITE_OCPCR, OCPCR, data);
  

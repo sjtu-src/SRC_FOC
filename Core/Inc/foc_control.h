@@ -19,6 +19,7 @@
 #define FOC_FAULT_ENCODER       (1UL << 2)
 #define FOC_FAULT_ALIGNMENT     (1UL << 3)
 #define FOC_FAULT_OVERCURRENT   (1UL << 4)
+#define FOC_FAULT_BUS_VOLTAGE   (1UL << 5)
 #define LED_5V      1
 #define LED_3V3     2
 
@@ -49,6 +50,9 @@ float FOC_GetSpeed(void);
 float FOC_GetIq(void);
 float FOC_GetId(void);
 float FOC_GetBusVoltage(void);
+/* 0..1 software I^2t usage and the corresponding present q-current ceiling. */
+float FOC_GetCurrentThermalUtilization(void);
+float FOC_GetDynamicIqLimit(void);
 FOC_ControlMode FOC_GetControlMode(void);
 /* Single-turn mechanical angle scaled to the legacy 0..16383 range. */
 uint16_t FOC_GetEncoderRawAngle(void);

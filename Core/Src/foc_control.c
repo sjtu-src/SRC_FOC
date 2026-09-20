@@ -15,20 +15,39 @@
 #define DC_BUS_DIVIDER_BOTTOM_OHM 7500.0f
 #define DC_BUS_MIN_VALID_V 5.0f
 #define DC_BUS_MAX_VALID_V 40.0f
+#define DC_BUS_RUNTIME_FAULT_SAMPLES 100U
+#define DC_BUS_STARTUP_MIN_V 9.0f
+#define DC_BUS_STARTUP_TIMEOUT_MS 10000U
+#define DC_BUS_STARTUP_STABLE_SAMPLES 20U
+#define DC_BUS_STARTUP_STABLE_RANGE_V 0.15f
 #define PWM_PERIOD 2125U
 #define MAX_MOD 0.90f
-#define MAX_IQ_CURRENT 10.0f
-#define PHASE_OVERCURRENT_LIMIT 10.0f
-#define CURRENT_OUTPUT_LIMIT 0.8f
+#define MAX_IQ_CURRENT 9.0f
+/* Attached 18-V winding data: allow TIGERs-like short torque bursts while
+   returning to the motor's approximately 3.5-A continuous rating thermally. */
+#define CONTINUOUS_IQ_CURRENT 3.5f
+#define CURRENT_THERMAL_TIME_CONSTANT_S 17.7f
+#define CURRENT_THERMAL_TAPER_START 0.80f
+/* The hard path behaves like the TIGERs comparator/OCREF path: an observed
+   peak first suppresses the next voltage vector and is allowed to recover.
+   Only current which remains excessive while zero voltage is being applied
+   is treated as a latched fault. The lower threshold catches a real sustained
+   control/sampling failure without reducing the requested 9-A torque current. */
+#define PHASE_SUSTAINED_CURRENT_LIMIT 11.0f
+#define PHASE_HARD_OVERCURRENT_LIMIT 15.0f
+#define PHASE_HARD_OVERCURRENT_SAMPLES 40U
+#define PHASE_SUSTAINED_OVERCURRENT_SAMPLES 400U
+#define PHASE_SUSTAINED_RECOVERY_PER_SAMPLE 4U
+#define CURRENT_OUTPUT_LIMIT 0.88f
 #define CURRENT_LOOP_HZ 20000.0f
-#define IQ_SLEW_RATE_A_PER_S 30.0f
+#define IQ_SLEW_RATE_A_PER_S 300.0f
+#define SPEED_IQ_SLEW_RATE_A_PER_S 2000.0f
 #define CURRENT_SENSE_BLANK_SAMPLES 20U
 #define MOTOR_TORQUE_CONSTANT_MNM_PER_A 25.1f
 #define MAX_SPEED_COMMAND_RPM 9000.0f
 #define RPM_TO_RAD_PER_SEC (FOC_2PI / 60.0f)
 #define SPEED_LOOP_HZ 1000.0f
-#define SPEED_REFERENCE_SLEW_RPM_PER_S 3000.0f
-#define SPEED_LOOP_CURRENT_LIMIT 2.0f
+#define SPEED_LOOP_CURRENT_LIMIT 9.0f
 #define ALIGN_VOLTAGE 0.04f
 /* MT6816 AB pulse count per mechanical revolution. TIM3 encoder mode counts
    four edges per pulse. Change this to 1000 for MT6816xx-AKD, etc. */
@@ -37,17 +56,29 @@
 #endif
 #define ENCODER_COUNTS_PER_REV (4U * MT6816_AB_PULSES_PER_REV)
 #define ENCODER_SPEED_SAMPLES 20U
-/* More than 256 counts in 50 us would exceed 75 krpm at 4096 count/rev and
-   is treated as an electrical glitch rather than real shaft motion. */
-#define ENCODER_MAX_DELTA_PER_SAMPLE 256
+/* At 4096 count/rev, 10000 rpm is only 34 counts per 50 us. Keep generous
+   overspeed margin while rejecting angle jumps large enough to upset Park. */
+#define ENCODER_MAX_DELTA_PER_SAMPLE 64
 #define ENCODER_MAX_CONSECUTIVE_GLITCHES 8U
 
 typedef struct { float kp, ki, integ, out; } pi_t;
 static volatile float angle, angle_multi, speed, iq, id, iq_ref_amp, iq_ref_target;
-static volatile float speed_target_rad_s, speed_ref_rad_s;
+static volatile float speed_target_rad_s;
 static volatile float dc_bus_voltage = DC_BUS_NOMINAL_V;
 static volatile float current_pi_bus_scale = 1.0f;
+volatile float foc_dc_bus_voltage_raw;
+volatile uint32_t foc_bus_voltage_read_failures;
+volatile uint32_t foc_bus_voltage_consecutive_failures;
+/* Latched most-recent bus-voltage failure:
+   0=no failure since boot, 1=ADC start failed, 2=ADC_V timeout,
+   4=non-finite conversion, 5=below 5 V, 6=above 40 V,
+   7=bus did not become stable before the startup timeout. */
+volatile uint32_t foc_bus_voltage_last_error;
+volatile uint32_t foc_bus_voltage_adc_raw;
+volatile float foc_current_thermal_utilization;
+volatile float foc_dynamic_iq_limit = MAX_IQ_CURRENT;
 static volatile uint32_t dc_bus_voltage_valid;
+static volatile uint32_t adc2_injected_started;
 static volatile FOC_ControlMode control_mode = FOC_MODE_TORQUE;
 static volatile uint8_t enc_initialized;
 static volatile uint16_t enc_raw;
@@ -62,61 +93,61 @@ volatile uint32_t encoder_bad_edge_count;
 volatile uint32_t encoder_fault_status_snapshot, encoder_fault_age_ms;
 static volatile uint32_t foc_state = FOC_STATE_IDLE, foc_fault;
 static volatile uint32_t overcurrent_detail;
+static volatile uint32_t overcurrent_trigger_type;
 static volatile uint32_t current_sense_blank_samples;
 /* Retained fault snapshot for the debugger. At 40 V/V and 1 milliohm,
    one ADC count is about 20.15 mA. */
 volatile uint16_t foc_fault_adc_u, foc_fault_adc_v;
 volatile float foc_fault_iu, foc_fault_iv, foc_fault_iw;
+volatile uint32_t foc_fault_hard_overcurrent_samples;
+volatile uint32_t foc_fault_sustained_overcurrent_samples;
+volatile float foc_fault_dynamic_iq_limit, foc_fault_thermal_utilization;
+volatile float foc_fault_bus_voltage;
+volatile float foc_fault_bus_voltage_raw;
+volatile float foc_fault_iq_ref, foc_fault_id, foc_fault_iq;
+volatile float foc_fault_vd, foc_fault_vq;
 volatile float foc_current_offset_u, foc_current_offset_v;
 volatile uint16_t drv_fault_status1_snapshot, drv_fault_status2_snapshot;
+volatile uint32_t drv_vds_ocp_event_count;
 static volatile uint32_t offset_samples;
 static float offset_u, offset_v;
 static volatile float align_theta;
 static float encoder_direction = 1.0f, electrical_offset;
-/* 330285: Rll=0.464 ohm, Lll=0.322 mH. Conservative current-loop
-   tuning for a 20 kHz update rate and approximately 16 V DC bus. */
-static pi_t pi_q = {0.1f, 0.003f, 0, 0};
-static pi_t pi_d = {0.1f, 0.003f, 0, 0};
+/* Current PI output is normalized SVPWM modulation. Gains are tuned at the
+   16-V nominal bus and compensated by current_pi_bus_scale at run time. */
+static pi_t pi_q = {0.12f, 0.005f, 0, 0};
+static pi_t pi_d = {0.12f, 0.005f, 0, 0};
 /* 1-kHz mechanical speed loop. Output is q-axis current in amperes.
    kp unit: A/(rad/s); ki is the per-sample integral coefficient. */
-static pi_t pi_speed = {0.02f, 0.00015f, 0, 0};
+static pi_t pi_speed = {0.15f, 0.008f, 0, 0};
 
 static float clamp(float x, float lo, float hi);
 
-static uint32_t update_bus_voltage(void)
+static uint32_t accept_bus_voltage_raw(uint32_t voltage_raw)
 {
-    uint32_t voltage_raw;
     float measured;
 
-    if (HAL_ADC_Start(&hadc2) != HAL_OK) { return 0U; }
-
-    /* ADC2 rank 1 is the temperature input; rank 2 is ADC_V. */
-    if (HAL_ADC_PollForConversion(&hadc2, 2U) != HAL_OK)
-    {
-        (void)HAL_ADC_Stop(&hadc2);
-        return 0U;
-    }
-    (void)HAL_ADC_GetValue(&hadc2);
-
-    if (HAL_ADC_PollForConversion(&hadc2, 2U) != HAL_OK)
-    {
-        (void)HAL_ADC_Stop(&hadc2);
-        return 0U;
-    }
-    voltage_raw = HAL_ADC_GetValue(&hadc2);
-    (void)HAL_ADC_Stop(&hadc2);
-
+    foc_bus_voltage_adc_raw = voltage_raw;
     measured = (float)voltage_raw * VREF / ADC_FS *
                (DC_BUS_DIVIDER_TOP_OHM + DC_BUS_DIVIDER_BOTTOM_OHM) /
                DC_BUS_DIVIDER_BOTTOM_OHM;
-    if (!isfinite(measured) || measured < DC_BUS_MIN_VALID_V ||
-        measured > DC_BUS_MAX_VALID_V)
+    foc_dc_bus_voltage_raw = measured;
+    if (!isfinite(measured))
     {
+        foc_bus_voltage_last_error = 4U;
+        return 0U;
+    }
+    if (measured < DC_BUS_MIN_VALID_V)
+    {
+        foc_bus_voltage_last_error = 5U;
+        return 0U;
+    }
+    if (measured > DC_BUS_MAX_VALID_V)
+    {
+        foc_bus_voltage_last_error = 6U;
         return 0U;
     }
 
-    /* The first sample must take effect before PWM starts. Later samples are
-       lightly filtered because this value only compensates slow bus changes. */
     if (!dc_bus_voltage_valid)
     {
         dc_bus_voltage = measured;
@@ -126,8 +157,117 @@ static uint32_t update_bus_voltage(void)
     {
         dc_bus_voltage = 0.2f * measured + 0.8f * dc_bus_voltage;
     }
-    current_pi_bus_scale = clamp(DC_BUS_NOMINAL_V / dc_bus_voltage, 0.4f, 1.5f);
+    current_pi_bus_scale = clamp(DC_BUS_NOMINAL_V / dc_bus_voltage,
+                                 0.4f, 1.5f);
     return 1U;
+}
+
+static float median3(float a, float b, float c)
+{
+    if (a > b) { float t = a; a = b; b = t; }
+    if (b > c) { float t = b; b = c; c = t; }
+    if (a > b) { float t = a; a = b; b = t; }
+    return b;
+}
+
+static void update_current_thermal_limit(float current_magnitude_sq)
+{
+    const float continuous_sq = CONTINUOUS_IQ_CURRENT * CONTINUOUS_IQ_CURRENT;
+    const float dt = 1.0f / CURRENT_LOOP_HZ;
+    float normalized_loss = current_magnitude_sq / continuous_sq;
+
+    /* First-order winding temperature estimate. A value of 1 corresponds to
+       the steady-state temperature rise at the continuous current rating. */
+    foc_current_thermal_utilization +=
+        (normalized_loss - foc_current_thermal_utilization) * dt /
+        CURRENT_THERMAL_TIME_CONSTANT_S;
+    foc_current_thermal_utilization = clamp(foc_current_thermal_utilization,
+                                            0.0f, 1.0f);
+
+    if (foc_current_thermal_utilization <= CURRENT_THERMAL_TAPER_START)
+    {
+        foc_dynamic_iq_limit = MAX_IQ_CURRENT;
+    }
+    else
+    {
+        float taper = (1.0f - foc_current_thermal_utilization) /
+                      (1.0f - CURRENT_THERMAL_TAPER_START);
+        foc_dynamic_iq_limit = CONTINUOUS_IQ_CURRENT +
+                               taper * (MAX_IQ_CURRENT - CONTINUOUS_IQ_CURRENT);
+    }
+}
+
+static uint32_t update_bus_voltage(void)
+{
+    uint32_t voltage_raw;
+
+    /* ADC2 becomes the simultaneous V-current slave once PWM starts. Its bus
+       voltage was already measured over a stable 200-ms startup window, so
+       retain that value for this run. A different supply is measured on the
+       next power-up/reset without disturbing current sampling. */
+    if (adc2_injected_started)
+    {
+        return dc_bus_voltage_valid;
+    }
+
+    if (HAL_ADC_Start(&hadc2) != HAL_OK)
+    {
+        foc_bus_voltage_last_error = 1U;
+        return 0U;
+    }
+
+    /* ADC2 has one regular channel only: PA4/ADC2_IN17 (ADC_V). Keeping
+       temperature out of this sequence prevents scan-rank misalignment. */
+    if (HAL_ADC_PollForConversion(&hadc2, 2U) != HAL_OK)
+    {
+        if (!adc2_injected_started) { (void)HAL_ADC_Stop(&hadc2); }
+        foc_bus_voltage_last_error = 2U;
+        return 0U;
+    }
+    voltage_raw = HAL_ADC_GetValue(&hadc2);
+    (void)HAL_ADC_Stop(&hadc2);
+    return accept_bus_voltage_raw(voltage_raw);
+}
+
+static uint32_t wait_for_stable_bus_voltage(void)
+{
+    uint32_t start_ms = HAL_GetTick();
+    uint32_t block_samples = 0U;
+    float block_min = DC_BUS_MAX_VALID_V;
+    float block_max = 0.0f;
+
+    while ((HAL_GetTick() - start_ms) < DC_BUS_STARTUP_TIMEOUT_MS)
+    {
+        if (update_bus_voltage() &&
+            foc_dc_bus_voltage_raw >= DC_BUS_STARTUP_MIN_V)
+        {
+            block_min = fminf(block_min, foc_dc_bus_voltage_raw);
+            block_max = fmaxf(block_max, foc_dc_bus_voltage_raw);
+            if (++block_samples >= DC_BUS_STARTUP_STABLE_SAMPLES)
+            {
+                /* Require a 200-ms block whose total variation is small.
+                   This lets a capacitor bank charge before enabling PWM. */
+                if ((block_max - block_min) <=
+                    DC_BUS_STARTUP_STABLE_RANGE_V)
+                {
+                    return 1U;
+                }
+                block_samples = 0U;
+                block_min = DC_BUS_MAX_VALID_V;
+                block_max = 0.0f;
+            }
+        }
+        else
+        {
+            block_samples = 0U;
+            block_min = DC_BUS_MAX_VALID_V;
+            block_max = 0.0f;
+        }
+        HAL_Delay(10U);
+    }
+
+    foc_bus_voltage_last_error = 7U;
+    return 0U;
 }
 
 static void led_set(int led, uint32_t on)
@@ -249,7 +389,6 @@ static void stop_fault(uint32_t fault)
     iq_ref_target = 0.0f;
     iq_ref_amp = 0.0f;
     speed_target_rad_s = 0.0f;
-    speed_ref_rad_s = 0.0f;
     pi_speed.integ = 0.0f;
     pi_speed.out = 0.0f;
     HAL_GPIO_WritePin(DRV_cotr_GPIO_Port, DRV_cotr_Pin, GPIO_PIN_RESET);
@@ -355,7 +494,6 @@ void FOC_SetTorqueMilliNewtonMeter(float torque_mnm)
     }
     control_mode = FOC_MODE_TORQUE;
     speed_target_rad_s = 0.0f;
-    speed_ref_rad_s = 0.0f;
     iq_ref_target = clamp(iq_command, -MAX_IQ_CURRENT, MAX_IQ_CURRENT);
     __set_PRIMASK(primask);
 }
@@ -371,9 +509,6 @@ void FOC_SetSpeedRPM(float speed_rpm)
         pi_speed.integ = 0.0f;
         pi_speed.out = 0.0f;
         iq_ref_target = 0.0f;
-        /* Start the command ramp from the actual mechanical speed so that a
-           mode change while rotating does not first command an abrupt brake. */
-        speed_ref_rad_s = encoder_direction * speed;
     }
     speed_target_rad_s = limited_rpm * RPM_TO_RAD_PER_SEC;
     control_mode = FOC_MODE_SPEED;
@@ -399,14 +534,39 @@ uint32_t FOC_ApplyCommandFrame(const FOC_CommandFrame *command)
 void FOC_PollDriverFault(void)
 {
     static uint32_t fault_reported;
+    static uint32_t consecutive_vds_fault_polls;
     uint32_t detail = 0U;
-    (void)update_bus_voltage();
+    uint32_t preamble_flashes = 4U;
+    if (update_bus_voltage())
+    {
+        foc_bus_voltage_consecutive_failures = 0U;
+    }
+    else
+    {
+        ++foc_bus_voltage_read_failures;
+        ++foc_bus_voltage_consecutive_failures;
+    }
+
+    /* A single conversion failure is harmless because the last valid bus
+       value remains available. Stop only after about one second of continuous
+       failures, which indicates a real ADC/range problem rather than noise. */
+    if (foc_bus_voltage_consecutive_failures >=
+            DC_BUS_RUNTIME_FAULT_SAMPLES &&
+        foc_state == FOC_STATE_RUNNING)
+    {
+        foc_fault_bus_voltage = foc_dc_bus_voltage_raw;
+        stop_fault(FOC_FAULT_BUS_VOLTAGE);
+    }
     if (fault_reported) { return; }
 
     if (foc_state == FOC_STATE_FAULT)
     {
         fault_reported = 1U;
-        /* Four quick flashes identify a controller-state fault, followed by:
+        /* Four quick flashes identify a non-current controller fault.
+           Software overcurrent uses five quick flashes for a hard peak or
+           six quick flashes for a sustained overload. A DC-bus fault uses
+           seven quick flashes, then 1..7 slow flashes for its ADC/range
+           error code. Other slow-flash details identify:
            1=startup, 2=encoder, 3=alignment,
            4=IU positive, 5=IU negative, 6=IV positive, 7=IV negative,
            8=IW positive, 9=IW negative overcurrent, 10=unknown overcurrent,
@@ -417,6 +577,17 @@ void FOC_PollDriverFault(void)
         else if (foc_fault & FOC_FAULT_OVERCURRENT)
         {
             detail = overcurrent_detail ? overcurrent_detail : 10U;
+            /* Five quick flashes mean >15 A persisted for about 2 ms despite
+               cycle-by-cycle zero-vector limiting.
+               Six quick flashes mean >11 A accumulated for about 20 ms. */
+            preamble_flashes = overcurrent_trigger_type == 1U ? 5U : 6U;
+        }
+        else if (foc_fault & FOC_FAULT_BUS_VOLTAGE)
+        {
+            preamble_flashes = 7U;
+            detail = (foc_bus_voltage_last_error >= 1U &&
+                      foc_bus_voltage_last_error <= 7U) ?
+                     foc_bus_voltage_last_error : 7U;
         }
         else { detail = 11U; }
 
@@ -424,7 +595,9 @@ void FOC_PollDriverFault(void)
         {
             led_set(LED_3V3, 0U);
             HAL_Delay(1200U);
-            for (uint32_t preamble = 0U; preamble < 4U; ++preamble)
+            for (uint32_t preamble = 0U;
+                 preamble < preamble_flashes;
+                 ++preamble)
             {
                 led_set(LED_3V3, 1U);
                 HAL_Delay(100U);
@@ -449,9 +622,28 @@ void FOC_PollDriverFault(void)
     DRV835X_read_FaultStatusReg2();
     if (stru_DRV8353Obj.faultStatusReg1_obj.data & (1U << 10))
     {
+        uint16_t status1 = stru_DRV8353Obj.faultStatusReg1_obj.data;
+        uint16_t status2 = stru_DRV8353Obj.faultStatusReg2_obj.data;
+        uint32_t vds_only =
+            (status1 & (1U << 9)) != 0U &&
+            (status1 & ((1U << 6) | (1U << 7) | (1U << 8))) == 0U &&
+            (status2 & 0x07ffU) == 0U;
+
+        drv_fault_status1_snapshot = status1;
+        drv_fault_status2_snapshot = status2;
+
+        /* OCP_RETRY removes the bridge drive for 8 ms and then tries again.
+           A single obstruction/ringing event must not permanently stop the
+           speed loop. Three consecutive 10-ms polls still identify a real
+           persistent power-stage fault and take the normal latched path. */
+        if (vds_only && ++consecutive_vds_fault_polls < 3U)
+        {
+            ++drv_vds_ocp_event_count;
+            return;
+        }
+
+        consecutive_vds_fault_polls = 0U;
         fault_reported = 1U;
-        drv_fault_status1_snapshot = stru_DRV8353Obj.faultStatusReg1_obj.data;
-        drv_fault_status2_snapshot = stru_DRV8353Obj.faultStatusReg2_obj.data;
         stop_fault(FOC_FAULT_DRIVER);
         /* Solid 5V LED means a runtime DRV8353 fault latched the bridge off. */
         led_set(LED_5V, 1U);
@@ -501,6 +693,10 @@ void FOC_PollDriverFault(void)
             HAL_Delay(1800U);
         }
     }
+    else
+    {
+        consecutive_vds_fault_polls = 0U;
+    }
 }
 
 /* Initialization runs once in main; interrupts continue during these waits. */
@@ -524,10 +720,15 @@ void FOC_Init(void)
 {
     /* ADC_V keeps the current-loop dynamics independent of supply voltage.
        Sample it before PWM can energize the motor. */
-    if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK ||
-        !update_bus_voltage())
+    if (HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED) != HAL_OK)
     {
         stop_fault(FOC_FAULT_STARTUP);
+        return;
+    }
+    if (!wait_for_stable_bus_voltage())
+    {
+        foc_fault_bus_voltage = foc_dc_bus_voltage_raw;
+        stop_fault(FOC_FAULT_BUS_VOLTAGE);
         return;
     }
     if (DRV835X_Init() != HAL_OK)
@@ -541,7 +742,15 @@ void FOC_Init(void)
     htim1.Instance->EGR = TIM_EGR_UG;
     foc_state = FOC_STATE_CALIBRATING;
     if (HAL_ADCEx_Calibration_Start(&hadc1,ADC_SINGLE_ENDED) != HAL_OK ||
-        HAL_ADCEx_InjectedStart_IT(&hadc1) != HAL_OK ||
+        HAL_ADCEx_InjectedStart_IT(&hadc2) != HAL_OK)
+    {
+        stop_fault(FOC_FAULT_STARTUP);
+        return;
+    }
+    /* Only ADC1/master raises the 20-kHz control interrupt. ADC2/slave still
+       converts simultaneously and its JDR1 is read from the ADC1 callback. */
+    __HAL_ADC_DISABLE_IT(&hadc2, ADC_IT_JEOC | ADC_IT_JEOS);
+    if (HAL_ADCEx_InjectedStart_IT(&hadc1) != HAL_OK ||
         HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_1) != HAL_OK ||
         HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_2) != HAL_OK ||
         HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_3) != HAL_OK ||
@@ -552,6 +761,7 @@ void FOC_Init(void)
         stop_fault(FOC_FAULT_STARTUP);
         return;
     }
+    adc2_injected_started = 1U;
     encoder_reset_position();
     /* Gather real CSA offsets with INL held low, not an assumed mid-scale. */
     uint32_t start = HAL_GetTick();
@@ -602,7 +812,6 @@ void FOC_Init(void)
     iq_ref_amp = 0.0f;
     iq_ref_target = 0.0f;
     speed_target_rad_s = 0.0f;
-    speed_ref_rad_s = 0.0f;
     current_sense_blank_samples = CURRENT_SENSE_BLANK_SAMPLES;
     pi_q.integ = 0.0f;
     pi_d.integ = 0.0f;
@@ -616,6 +825,8 @@ float FOC_GetSpeed(void){return encoder_direction*speed;}
 float FOC_GetIq(void){return iq;}
 float FOC_GetId(void){return id;}
 float FOC_GetBusVoltage(void){return dc_bus_voltage;}
+float FOC_GetCurrentThermalUtilization(void){return foc_current_thermal_utilization;}
+float FOC_GetDynamicIqLimit(void){return foc_dynamic_iq_limit;}
 FOC_ControlMode FOC_GetControlMode(void){return control_mode;}
 uint16_t FOC_GetEncoderRawAngle(void){return enc_raw;}
 uint32_t FOC_GetEncoderStatus(void){return enc_status;}
@@ -626,45 +837,53 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *h)
 {
     if(h->Instance==TIM5)
         {
+            static float speed_history_1, speed_history_2;
+            static uint32_t speed_history_valid;
             if (!encoder_healthy()) { speed=0.0f; return; }
             float instant_speed = (float)enc_speed_counts * FOC_2PI *
                                   SPEED_LOOP_HZ /
                                   (float)ENCODER_COUNTS_PER_REV;
             speed=0.15f*instant_speed+0.85f*speed;
 
+            float control_speed = instant_speed;
+            if (speed_history_valid >= 2U)
+            {
+                /* Reject one isolated encoder-speed spike. A real sustained
+                   speed change reaches the controller one millisecond later. */
+                control_speed = median3(instant_speed,
+                                        speed_history_1,
+                                        speed_history_2);
+            }
+            else { ++speed_history_valid; }
+            speed_history_2 = speed_history_1;
+            speed_history_1 = instant_speed;
+
             if (foc_state == FOC_STATE_RUNNING && control_mode == FOC_MODE_SPEED)
             {
-                const float speed_step = SPEED_REFERENCE_SLEW_RPM_PER_S *
-                                         RPM_TO_RAD_PER_SEC / SPEED_LOOP_HZ;
-                if (speed_ref_rad_s < speed_target_rad_s)
-                {
-                    speed_ref_rad_s = fminf(speed_ref_rad_s + speed_step,
-                                            speed_target_rad_s);
-                }
-                else if (speed_ref_rad_s > speed_target_rad_s)
-                {
-                    speed_ref_rad_s = fmaxf(speed_ref_rad_s - speed_step,
-                                            speed_target_rad_s);
-                }
-
-                float speed_error = speed_ref_rad_s - encoder_direction * speed;
+                /* Use the unfiltered 1-ms encoder delta in the controller.
+                   The filtered speed above is telemetry only; feeding it back
+                   added several milliseconds of delay and weakened braking. */
+                float speed_feedback = encoder_direction * control_speed;
+                float speed_error = speed_target_rad_s - speed_feedback;
                 float proportional = pi_speed.kp * speed_error;
+                float speed_current_limit = fminf(SPEED_LOOP_CURRENT_LIMIT,
+                                                  foc_dynamic_iq_limit);
                 float integral_candidate = clamp(pi_speed.integ +
                                                    pi_speed.ki * speed_error,
-                                                   -SPEED_LOOP_CURRENT_LIMIT,
-                                                   SPEED_LOOP_CURRENT_LIMIT);
+                                                   -speed_current_limit,
+                                                   speed_current_limit);
                 float output_candidate = proportional + integral_candidate;
 
                 /* Do not integrate farther into current saturation. Integration
                    remains active when the error helps the output leave it. */
-                if (!((output_candidate > SPEED_LOOP_CURRENT_LIMIT && speed_error > 0.0f) ||
-                      (output_candidate < -SPEED_LOOP_CURRENT_LIMIT && speed_error < 0.0f)))
+                if (!((output_candidate > speed_current_limit && speed_error > 0.0f) ||
+                      (output_candidate < -speed_current_limit && speed_error < 0.0f)))
                 {
                     pi_speed.integ = integral_candidate;
                 }
                 pi_speed.out = clamp(proportional + pi_speed.integ,
-                                     -SPEED_LOOP_CURRENT_LIMIT,
-                                     SPEED_LOOP_CURRENT_LIMIT);
+                                     -speed_current_limit,
+                                     speed_current_limit);
                 iq_ref_target = pi_speed.out;
             }
         }
@@ -673,7 +892,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *h)
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
 {
     static uint32_t control_divider;
-    static uint32_t overcurrent_count;
+    static uint32_t hard_overcurrent_count;
+    static uint32_t sustained_overcurrent_score;
+    static float current_adc_sum_u;
+    static float current_adc_sum_v;
     if(h->Instance!=ADC1)  return;
 
     // calibrate ADC
@@ -682,7 +904,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
         if (offset_samples < 128U)
         {
             offset_u += (float)h->Instance->JDR1;
-            offset_v += (float)h->Instance->JDR2;
+            offset_v += (float)hadc2.Instance->JDR1;
             if (offset_samples == 127U)
             {
                 offset_u /= 128.0f;
@@ -695,9 +917,17 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
         return;
     }
 
-    /* Run Clarke/Park and the PI controllers at 20 kHz. */
+    /* ADC1/ADC2 sample U/V simultaneously at 40 kHz. Following the TIGERs
+       principle of paired current samples, average two PWM-cycle samples for
+       one 20-kHz control update instead of discarding the first sample. */
+    current_adc_sum_u += (float)h->Instance->JDR1;
+    current_adc_sum_v += (float)hadc2.Instance->JDR1;
     if (++control_divider < 2U) { return; }
     control_divider = 0U;
+    float current_adc_u = 0.5f * current_adc_sum_u;
+    float current_adc_v = 0.5f * current_adc_sum_v;
+    current_adc_sum_u = 0.0f;
+    current_adc_sum_v = 0.0f;
 
     encoder_sample();
 
@@ -715,44 +945,94 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
        CSAs. The measured response under sufficient voltage shows that the
        direct SPA-SNA polarity closes the current loop as negative feedback. */
 
-    float iu=VREF*((float)h->Instance->JDR1-offset_u)/(ADC_FS*SHUNT_OHM*AMP_GAIN);
-    float iv=VREF*((float)h->Instance->JDR2-offset_v)/(ADC_FS*SHUNT_OHM*AMP_GAIN);
+    float iu=VREF*(current_adc_u-offset_u)/(ADC_FS*SHUNT_OHM*AMP_GAIN);
+    float iv=VREF*(current_adc_v-offset_v)/(ADC_FS*SHUNT_OHM*AMP_GAIN);
 
     float iw=-iu-iv;
     if (current_sense_blank_samples > 0U)
     {
         --current_sense_blank_samples;
-        overcurrent_count = 0U;
+        hard_overcurrent_count = 0U;
+        sustained_overcurrent_score = 0U;
         pwm(0.5f,0.5f,0.5f);
         HAL_GPIO_WritePin(DRV_cotr_GPIO_Port, DRV_cotr_Pin, GPIO_PIN_SET);
         return;
     }
 
-    if (fabsf(iu) > PHASE_OVERCURRENT_LIMIT ||
-        fabsf(iv) > PHASE_OVERCURRENT_LIMIT ||
-        fabsf(iw) > PHASE_OVERCURRENT_LIMIT)
+    float abs_iu = fabsf(iu);
+    float abs_iv = fabsf(iv);
+    float abs_iw = fabsf(iw);
+    float max_phase_current = fmaxf(abs_iu, fmaxf(abs_iv, abs_iw));
+
+    if (abs_iu >= abs_iv && abs_iu >= abs_iw)
     {
-        if (iu > PHASE_OVERCURRENT_LIMIT) { overcurrent_detail = 4U; }
-        else if (iu < -PHASE_OVERCURRENT_LIMIT) { overcurrent_detail = 5U; }
-        else if (iv > PHASE_OVERCURRENT_LIMIT) { overcurrent_detail = 6U; }
-        else if (iv < -PHASE_OVERCURRENT_LIMIT) { overcurrent_detail = 7U; }
-        else if (iw > PHASE_OVERCURRENT_LIMIT) { overcurrent_detail = 8U; }
-        else { overcurrent_detail = 9U; }
-        /* Reject an isolated PWM-edge sample; three consecutive samples are
-           only 150 us at the 20 kHz loop rate. Hardware OCP remains immediate. */
-        if (++overcurrent_count >= 30U)
+        overcurrent_detail = iu >= 0.0f ? 4U : 5U;
+    }
+    else if (abs_iv >= abs_iw)
+    {
+        overcurrent_detail = iv >= 0.0f ? 6U : 7U;
+    }
+    else
+    {
+        overcurrent_detail = iw >= 0.0f ? 8U : 9U;
+    }
+
+    if (max_phase_current > PHASE_HARD_OVERCURRENT_LIMIT)
+    {
+        ++hard_overcurrent_count;
+    }
+    else { hard_overcurrent_count = 0U; }
+
+    if (max_phase_current > PHASE_SUSTAINED_CURRENT_LIMIT)
+    {
+        if (sustained_overcurrent_score < PHASE_SUSTAINED_OVERCURRENT_SAMPLES)
         {
-            foc_fault_adc_u = (uint16_t)h->Instance->JDR1;
-            foc_fault_adc_v = (uint16_t)h->Instance->JDR2;
-            foc_fault_iu = iu;
-            foc_fault_iv = iv;
-            foc_fault_iw = iw;
-            stop_fault(FOC_FAULT_OVERCURRENT);
-            led_set(LED_3V3, 1U);
-            return;
+            ++sustained_overcurrent_score;
         }
     }
-    else { overcurrent_count = 0U; }
+    else if (sustained_overcurrent_score > PHASE_SUSTAINED_RECOVERY_PER_SAMPLE)
+    {
+        sustained_overcurrent_score -= PHASE_SUSTAINED_RECOVERY_PER_SAMPLE;
+    }
+    else { sustained_overcurrent_score = 0U; }
+
+    /* TIGERs clears the active PWM pulse from a hardware current comparator
+       and resumes automatically. We cannot reproduce that asynchronous path
+       with two ADC shunts, so suppress the next complete voltage vector when
+       a hard peak is observed. A transient therefore costs torque for one
+       control interval instead of latching the whole motor off. */
+    if (hard_overcurrent_count >= PHASE_HARD_OVERCURRENT_SAMPLES ||
+        sustained_overcurrent_score >= PHASE_SUSTAINED_OVERCURRENT_SAMPLES)
+    {
+        overcurrent_trigger_type =
+            hard_overcurrent_count >= PHASE_HARD_OVERCURRENT_SAMPLES ? 1U : 2U;
+        foc_fault_adc_u = (uint16_t)current_adc_u;
+        foc_fault_adc_v = (uint16_t)current_adc_v;
+        foc_fault_iu = iu;
+        foc_fault_iv = iv;
+        foc_fault_iw = iw;
+        foc_fault_hard_overcurrent_samples = hard_overcurrent_count;
+        foc_fault_sustained_overcurrent_samples = sustained_overcurrent_score;
+        foc_fault_dynamic_iq_limit = foc_dynamic_iq_limit;
+        foc_fault_thermal_utilization = foc_current_thermal_utilization;
+        foc_fault_bus_voltage = dc_bus_voltage;
+        foc_fault_bus_voltage_raw = foc_dc_bus_voltage_raw;
+        foc_fault_iq_ref = iq_ref_amp;
+        foc_fault_id = id;
+        foc_fault_iq = iq;
+        foc_fault_vd = pi_d.out;
+        foc_fault_vq = pi_q.out;
+        stop_fault(FOC_FAULT_OVERCURRENT);
+        led_set(LED_3V3, 1U);
+        return;
+    }
+
+    if (max_phase_current > PHASE_HARD_OVERCURRENT_LIMIT)
+    {
+        pwm(0.5f, 0.5f, 0.5f);
+        HAL_GPIO_WritePin(DRV_cotr_GPIO_Port, DRV_cotr_Pin, GPIO_PIN_SET);
+        return;
+    }
 
     /* Amplitude-invariant Clarke transform for two-shunt sampling.
        With iw=-iu-iv, this is the reduced form of the full 2/3 transform. */
@@ -775,30 +1055,45 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
         return;
     }
 
-    float iq_step=IQ_SLEW_RATE_A_PER_S/CURRENT_LOOP_HZ;
-    if (iq_ref_amp < iq_ref_target)
+    /* I^2t limiter: full 9-A q current is available for acceleration/impact,
+       then the limit tapers smoothly toward the continuous winding rating. */
+    update_current_thermal_limit(id*id + iq*iq);
+    float limited_iq_target = clamp(iq_ref_target,
+                                    -foc_dynamic_iq_limit,
+                                    foc_dynamic_iq_limit);
+    /* This limits the electrical current step, not the speed command. Speed
+       mode still reaches 9 A in 4.5 ms, but avoids a discontinuous current
+       reference that can excite the current loop and sampling transients. */
+    float iq_slew_rate = control_mode == FOC_MODE_SPEED ?
+                         SPEED_IQ_SLEW_RATE_A_PER_S : IQ_SLEW_RATE_A_PER_S;
+    float iq_step=iq_slew_rate/CURRENT_LOOP_HZ;
+    if (iq_ref_amp < limited_iq_target)
     {
-        iq_ref_amp=fminf(iq_ref_amp+iq_step,iq_ref_target);
+        iq_ref_amp=fminf(iq_ref_amp+iq_step,limited_iq_target);
     }
-    else if (iq_ref_amp > iq_ref_target)
+    else if (iq_ref_amp > limited_iq_target)
     {
-        iq_ref_amp=fmaxf(iq_ref_amp-iq_step,iq_ref_target);
+        iq_ref_amp=fmaxf(iq_ref_amp-iq_step,limited_iq_target);
     }
 
     float eq=iq_ref_amp-iq;
     float ed=-id;
 
-    // PI control
-    /* PI gains were tuned at DC_BUS_NOMINAL_V. Since PI output is normalized
-       PWM modulation, scale it inversely with the measured DC bus voltage. */
+    /* Restore the previously proven normalized current PI. Scaling its gains
+       and integral increment by 16/Vbus preserves the response across the
+       intended supply range without changing the PI state representation. */
     float bus_scale = current_pi_bus_scale;
     float q_proportional=pi_q.kp*eq*bus_scale;
     float d_proportional=pi_d.kp*ed*bus_scale;
-    pi_q.integ=clamp(pi_q.integ+pi_q.ki*eq*bus_scale,-CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
-    pi_q.out=clamp(q_proportional+pi_q.integ,-CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
+    pi_q.integ=clamp(pi_q.integ+pi_q.ki*eq*bus_scale,
+                     -CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
+    pi_q.out=clamp(q_proportional+pi_q.integ,
+                   -CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
 
-    pi_d.integ=clamp(pi_d.integ+pi_d.ki*ed*bus_scale,-CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
-    pi_d.out=clamp(d_proportional+pi_d.integ,-CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
+    pi_d.integ=clamp(pi_d.integ+pi_d.ki*ed*bus_scale,
+                     -CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
+    pi_d.out=clamp(d_proportional+pi_d.integ,
+                   -CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
 
     /* Limit the combined voltage vector, not each axis independently. This
        keeps the minimum low-side conduction window available for ADC ranks. */
@@ -813,8 +1108,10 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *h)
     /* Back-calculate both integrators from the voltage actually applied.
        Without this, vector limiting leaves a hidden saturated integrator and
        can drive the phase current past the target when it unwinds. */
-    pi_q.integ=clamp(pi_q.out-q_proportional,-CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
-    pi_d.integ=clamp(pi_d.out-d_proportional,-CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
+    pi_q.integ=clamp(pi_q.out-q_proportional,
+                     -CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
+    pi_d.integ=clamp(pi_d.out-d_proportional,
+                     -CURRENT_OUTPUT_LIMIT,CURRENT_OUTPUT_LIMIT);
 
     svpwm(theta,pi_d.out,pi_q.out);
     HAL_GPIO_WritePin(DRV_cotr_GPIO_Port, DRV_cotr_Pin, GPIO_PIN_SET);

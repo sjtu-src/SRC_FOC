@@ -18,7 +18,7 @@
 #define FOC_DEBUG_FAKE_COMMAND 1
 #endif
 #define FOC_DEBUG_COMMAND_MODE  FOC_MODE_SPEED
-#define FOC_DEBUG_COMMAND_VALUE 1000
+#define FOC_DEBUG_COMMAND_VALUE 3000
 
 static const FOC_CommandFrame debug_command =
 {

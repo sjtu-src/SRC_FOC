@@ -343,6 +343,7 @@ typedef struct
    uint8_t OCP_DEG;
    uint8_t OCP_MODE;
    uint8_t DEAD_TIME;
+   uint8_t TRETRY;
     
    //Gate Drive HS Register (address = 0x03h)
    uint8_t IDRIVEP_HS;
